@@ -1,0 +1,89 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // -------------------------------------------------------------------------
+    // GLOBAL HELPERS
+    // -------------------------------------------------------------------------
+    function isSignedIn() { return request.auth != null; }
+    function authUid() { return request.auth.uid; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    
+    // -------------------------------------------------------------------------
+    // DEFAULT DENY
+    // -------------------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // USERS COLLECTION
+    // -------------------------------------------------------------------------
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['email', 'createdAt']) &&
+               data.email is string && data.email.size() <= 256 &&
+               (data.displayName == null || (data.displayName is string && data.displayName.size() <= 128)) &&
+               (data.settings == null || data.settings is map);
+      }
+
+      allow get: if isSignedIn() && userId == authUid();
+      allow list: if false; // Users can't list profile data
+      allow create: if isSignedIn() && userId == authUid() && isValidUser(incoming());
+      allow update: if isSignedIn() && userId == authUid() && isValidUser(incoming()) &&
+                    incoming().email == existing().email &&
+                    incoming().createdAt == existing().createdAt;
+    }
+
+    // -------------------------------------------------------------------------
+    // TASKS COLLECTION
+    // -------------------------------------------------------------------------
+    match /tasks/{taskId} {
+      function isValidTask(data) {
+        return data.keys().hasAll(['text', 'completed', 'priority', 'category', 'ownerId', 'createdAt']) &&
+               data.text is string && data.text.size() <= 1000 &&
+               data.completed is bool &&
+               data.priority in ['low', 'medium', 'high'] &&
+               data.category is string && data.category.size() <= 128 &&
+               data.ownerId == authUid() &&
+               (data.collaborators == null || (data.collaborators is list && data.collaborators.size() <= 50));
+      }
+
+      function isRole(task) {
+        return task.ownerId == authUid() || (task.collaborators != null && authUid() in task.collaborators);
+      }
+
+      allow get: if isSignedIn() && isRole(existing());
+      allow list: if isSignedIn() && isRole(existing());
+      allow create: if isSignedIn() && isValidId(taskId) && isValidTask(incoming()) &&
+                    incoming().createdAt == request.time;
+      allow update: if isSignedIn() && isRole(existing()) && isValidTask(incoming()) &&
+                    incoming().ownerId == existing().ownerId &&
+                    incoming().createdAt == existing().createdAt && (
+                      // Owner can change everything except immutable fields
+                      existing().ownerId == authUid() ||
+                      // Collaborators can only change text, description, completed, priority, category
+                      incoming().diff(existing()).affectedKeys().hasOnly(['text', 'description', 'completed', 'priority', 'category', 'updatedAt', 'summary'])
+                    );
+      allow delete: if isSignedIn() && existing().ownerId == authUid();
+
+      // -------------------------------------------------------------------------
+      // COMMENTS SUBCOLLECTION
+      // -------------------------------------------------------------------------
+      match /comments/{commentId} {
+        function isValidComment(data) {
+          return data.keys().hasAll(['userId', 'text', 'createdAt']) &&
+                 data.userId == authUid() &&
+                 data.text is string && data.text.size() <= 2000;
+        }
+
+        allow read: if isSignedIn() && isRole(get(/databases/$(database)/documents/tasks/$(taskId)).data);
+        allow create: if isSignedIn() && isRole(get(/databases/$(database)/documents/tasks/$(taskId)).data) &&
+                      isValidId(commentId) && isValidComment(incoming()) &&
+                      incoming().createdAt == request.time;
+      }
+    }
+  }
+}
